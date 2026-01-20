@@ -1,0 +1,205 @@
+# =============================================================================
+# CD Pipeline - Continuous Deployment Workflow
+# =============================================================================
+# This workflow runs after CI completes successfully (or can be triggered manually)
+# It deploys the application to a Kind (Kubernetes in Docker) cluster
+# =============================================================================
+
+name: CD Pipeline
+
+on:
+  # Trigger after CI workflow completes successfully
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types:
+      - completed
+    branches: [master, main]
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: devops-todo-api
+  CLUSTER_NAME: devops-cluster
+
+jobs:
+  # ===========================================================================
+  # Deploy to Kubernetes (Kind)
+  # ===========================================================================
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    # Only run if CI was successful (or if manually triggered)
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Checkout source code
+      # -----------------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 2: Install Kind (Kubernetes in Docker)
+      # -----------------------------------------------------------------------
+      - name: Install Kind
+        run: |
+          # Download and install Kind
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+          # Verify installation
+          kind version
+
+      # -----------------------------------------------------------------------
+      # Step 3: Create Kind Kubernetes Cluster
+      # -----------------------------------------------------------------------
+      - name: Create Kind cluster
+        run: |
+          # Create a single-node Kubernetes cluster
+          kind create cluster --name ${{ env.CLUSTER_NAME }} --wait 60s
+
+          # Verify cluster is running
+          kubectl cluster-info --context kind-${{ env.CLUSTER_NAME }}
+          kubectl get nodes
+
+      # -----------------------------------------------------------------------
+      # Step 4: Pull Docker image from DockerHub
+      # -----------------------------------------------------------------------
+      - name: Pull Docker image
+        run: |
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+
+      # -----------------------------------------------------------------------
+      # Step 5: Load Docker image into Kind cluster
+      # -----------------------------------------------------------------------
+      - name: Load image into Kind
+        run: |
+          # Kind needs images loaded into the cluster
+          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest \
+            --name ${{ env.CLUSTER_NAME }}
+
+      # -----------------------------------------------------------------------
+      # Step 6: Update Kubernetes manifests with correct image
+      # -----------------------------------------------------------------------
+      - name: Update K8s manifests
+        run: |
+          # Replace placeholder with actual DockerHub username
+          sed -i "s|YOUR_DOCKERHUB_USERNAME|${{ secrets.DOCKERHUB_USERNAME }}|g" k8s/deployment.yaml
+
+          # Show the updated deployment file
+          echo "Updated deployment.yaml:"
+          cat k8s/deployment.yaml
+
+      # -----------------------------------------------------------------------
+      # Step 7: Deploy to Kubernetes
+      # -----------------------------------------------------------------------
+      - name: Deploy to Kubernetes
+        run: |
+          # Apply the Kubernetes manifests
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+          # Wait for deployment to be ready
+          echo "Waiting for deployment to be ready..."
+          kubectl rollout status deployment/devops-todo-api --timeout=120s
+
+          # Show deployment status
+          kubectl get deployments
+          kubectl get pods
+          kubectl get services
+
+      # -----------------------------------------------------------------------
+      # Step 8: DAST - Basic Health Checks
+      # -----------------------------------------------------------------------
+      - name: Run DAST health checks
+        run: |
+          # Port-forward the service to localhost
+          kubectl port-forward service/devops-todo-api-service 3000:3000 &
+          PF_PID=$!
+
+          # Wait for port-forward to be ready
+          sleep 10
+
+          echo "=== Running DAST Health Checks ==="
+
+          # Test 1: Health endpoint
+          echo "Test 1: Checking /api/health endpoint..."
+          HEALTH_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/health)
+          if [ "$HEALTH_RESPONSE" = "200" ]; then
+            echo "✓ Health check passed (HTTP $HEALTH_RESPONSE)"
+          else
+            echo "✗ Health check failed (HTTP $HEALTH_RESPONSE)"
+            kill $PF_PID 2>/dev/null
+            exit 1
+          fi
+
+          # Test 2: API endpoint responds
+          echo "Test 2: Checking /api/todos endpoint..."
+          TODOS_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/todos)
+          if [ "$TODOS_RESPONSE" = "200" ]; then
+            echo "✓ Todos endpoint passed (HTTP $TODOS_RESPONSE)"
+          else
+            echo "✗ Todos endpoint failed (HTTP $TODOS_RESPONSE)"
+            kill $PF_PID 2>/dev/null
+            exit 1
+          fi
+
+          # Test 3: POST request works
+          echo "Test 3: Testing POST /api/todos..."
+          POST_RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"title":"Test Todo","description":"Test Description"}' \
+            http://localhost:3000/api/todos)
+          if [ "$POST_RESPONSE" = "201" ]; then
+            echo "✓ POST request passed (HTTP $POST_RESPONSE)"
+          else
+            echo "✗ POST request failed (HTTP $POST_RESPONSE)"
+            kill $PF_PID 2>/dev/null
+            exit 1
+          fi
+
+          echo ""
+          echo "=== All DAST Health Checks Passed! ==="
+
+          # Cleanup port-forward
+          kill $PF_PID 2>/dev/null
+
+      # -----------------------------------------------------------------------
+      # Step 9: Verify Deployment Success
+      # -----------------------------------------------------------------------
+      - name: Verify deployment
+        run: |
+          echo "=== Deployment Verification ==="
+
+          # Check pod status
+          echo "Pod Status:"
+          kubectl get pods -l app=devops-todo-api
+
+          # Check if pod is running
+          POD_STATUS=$(kubectl get pods -l app=devops-todo-api -o jsonpath='{.items[0].status.phase}')
+          if [ "$POD_STATUS" = "Running" ]; then
+            echo "✓ Pod is running"
+          else
+            echo "✗ Pod is not running (Status: $POD_STATUS)"
+            exit 1
+          fi
+
+          # Get pod logs (last 20 lines)
+          echo ""
+          echo "Pod Logs (last 20 lines):"
+          kubectl logs -l app=devops-todo-api --tail=20
+
+          echo ""
+          echo "=== Deployment Successful! ==="
+
+      # -----------------------------------------------------------------------
+      # Step 10: Cleanup Kind cluster
+      # -----------------------------------------------------------------------
+      - name: Cleanup
+        if: always()
+        run: |
+          # Delete the Kind cluster
+          kind delete cluster --name ${{ env.CLUSTER_NAME }}
+          echo "Kind cluster cleaned up"
